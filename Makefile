@@ -1,42 +1,56 @@
 .PHONY: help install clean format lint test pre-commit-install pre-commit-run check
 
-VENV          := .venv
-PYTHON        := $(VENV)/bin/python
-PIP           := $(VENV)/bin/pip
-BLACK         := $(VENV)/bin/black
-RUFF          := $(VENV)/bin/ruff
-PRE_COMMIT    := $(VENV)/bin/pre-commit
-PYTEST        := $(VENV)/bin/pytest
-STAMP         := $(VENV)/.install.stamp
+# ---------------------------------------------------------------------------
+# Cross-platform setup.
+#
+# On Windows, cmd.exe is happiest with backslashes in direct path
+# invocations, and venv binaries live in .venv\Scripts\. On Unix
+# shells, it's forward slashes and .venv/bin/. We pick once at the top.
+#
+# Everything else is invoked as `$(PYTHON) -m <module>` so we only ever
+# need ONE path to be correct (the venv's python) — pip, black, ruff,
+# pytest, and pre-commit all support `-m`.
+# ---------------------------------------------------------------------------
+
+ifeq ($(OS),Windows_NT)
+    PYTHON     := .venv\Scripts\python.exe
+    PYTHON_SYS := python
+else
+    PYTHON     := .venv/bin/python
+    PYTHON_SYS := python3
+endif
+
+STAMP := .venv/.install.stamp
 
 help:  ## Show this help
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@$(PYTHON_SYS) -c "import re; [print(f'  {m.group(1):<22s} {m.group(2)}') for line in open('Makefile') for m in [re.match(r'^([a-zA-Z_-]+):.*?## (.*)$$', line)] if m]"
 
 install: $(STAMP)  ## Create venv and install dev dependencies (idempotent)
 
 $(STAMP): pyproject.toml
-	@test -d $(VENV) || python3 -m venv $(VENV)
-	$(PIP) install --upgrade pip
-	$(PIP) install -e ".[dev]"
-	@touch $(STAMP)
+	@$(PYTHON_SYS) -c "import os,venv; (None if os.path.isdir('.venv') else venv.EnvBuilder(with_pip=True).create('.venv'))"
+	$(PYTHON) -m pip install --upgrade pip
+	$(PYTHON) -m pip install -e ".[dev]"
+	@$(PYTHON_SYS) -c "open(r'$(STAMP)','w').close()"
 
 format: $(STAMP)  ## Run black
-	$(BLACK) src tests
+	$(PYTHON) -m black src tests
 
 lint: $(STAMP)  ## Run ruff (lint only, never `ruff format`)
-	$(RUFF) check src tests
+	$(PYTHON) -m ruff check src tests
 
 test: $(STAMP)  ## Run pytest
-	$(PYTEST)
+	$(PYTHON) -m pytest
 
 pre-commit-install: $(STAMP)  ## Install git hooks
-	$(PRE_COMMIT) install
+	$(PYTHON) -m pre_commit install
 
 pre-commit-run: $(STAMP)  ## Run pre-commit against all files
-	$(PRE_COMMIT) run --all-files
+	$(PYTHON) -m pre_commit run --all-files
 
 check: lint test  ## Lint + test
 
 clean:  ## Remove venv and caches
-	rm -rf $(VENV) .pytest_cache .ruff_cache build dist *.egg-info
-	find . -type d -name __pycache__ -exec rm -rf {} +
+	@$(PYTHON_SYS) -c "import shutil; [shutil.rmtree(p,ignore_errors=True) for p in ['.venv','.pytest_cache','.ruff_cache','build','dist']]"
+	@$(PYTHON_SYS) -c "import shutil,os; [shutil.rmtree(os.path.join(r,d),ignore_errors=True) for r,ds,_ in os.walk('.') for d in ds if d=='__pycache__']"
+	@$(PYTHON_SYS) -c "import shutil,glob; [shutil.rmtree(p,ignore_errors=True) for p in glob.glob('*.egg-info') + glob.glob('src/*.egg-info')]"
