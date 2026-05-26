@@ -1,28 +1,42 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
 *.egg-info/
+*.egg
 build/
 dist/
+.eggs/
+
+# Virtual envs
+.venv/
+.venv.installed
+venv/
+env/
+
+# Tests / coverage
 .pytest_cache/
 .ruff_cache/
-.mypy_cache/
+.coverage
+htmlcov/
+.tox/
 
-# Venv
-.venv/
-venv/
+# Local databases — never commit
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env
+*.json
+!**/fixtures/**/*.json
 
 # IDE
-.vscode/
 .idea/
+.vscode/
 *.swp
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Local
-.env
-*.db
-*.db-wal
-*.db-shm

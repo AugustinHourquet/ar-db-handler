@@ -1,12 +1,12 @@
-"""Read helpers across both databases."""
+"""Public API of the ``queries`` subpackage."""
 
-from __future__ import annotations
-
-from .filings import get_filing, get_filing_file, get_scraped_pairs, list_companies
+from .filings import get_file, get_scraped_files, get_scraped_pairs, list_companies
+from .metrics import get_metric
 
 __all__ = [
-    "get_filing",
-    "get_filing_file",
+    "get_file",
+    "get_scraped_files",
     "get_scraped_pairs",
     "list_companies",
+    "get_metric",
 ]

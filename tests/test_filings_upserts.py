@@ -1,4 +1,4 @@
-"""Upsert-rule tests for filings.db."""
+"""Tests for the filings.db upsert helpers."""
 
 from __future__ import annotations
 
@@ -7,305 +7,467 @@ import pytest
 from ar_db_handler import (
     AlreadyScrapedError,
     CompanyRecord,
-    FilingFileRecord,
-    FilingRecord,
-    RunRecord,
-    WorkerRecord,
-    get_filing,
-    get_filing_file,
+    make_file_id,
+    update_run_finished,
     upsert_company,
-    upsert_filing,
-    upsert_filing_file,
-    upsert_run,
-    upsert_worker,
+    upsert_file,
 )
+from tests.conftest import make_file_record
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _ff(
-    *,
-    file_id: str = "ff-1",
-    filing_id: str = "f-1",
-    run_id: str = "run-1",
-    worker_id: int | None = 1,
-    file_type: str = "PDF",
-    form_type: str | None = "10-K",
-    gcs_path: str | None = "gs://b/p.pdf",
-    url: str | None = "https://x",
-    scrape_status: str = "PENDING",
-    scraped_at: str | None = None,
-) -> FilingFileRecord:
-    return FilingFileRecord(
-        file_id=file_id,
-        filing_id=filing_id,
-        run_id=run_id,
-        worker_id=worker_id,
-        file_type=file_type,
-        form_type=form_type,
-        gcs_path=gcs_path,
-        url=url,
-        scrape_status=scrape_status,
-        scraped_at=scraped_at,
-    )
-
-
-# ---------------------------------------------------------------------------
-# scraper_runs
+# upsert_file — the rich case
 # ---------------------------------------------------------------------------
 
 
-def test_upsert_run_inserts_parent_row(filings_db):
-    upsert_run(
-        filings_db,
-        RunRecord(
-            run_id="run-1",
-            parent_run_id=None,
-            country="US",
-            started_at="2026-01-01T00:00:00",
-            finished_at=None,
-            status="RUNNING",
-            config='{"k": 1}',
-            worker_count=2,
-        ),
-    )
-    row = filings_db.execute("SELECT * FROM scraper_runs WHERE run_id='run-1'").fetchone()
-    assert row["worker_id"] is None
-    assert row["country"] == "US"
-    assert row["status"] == "RUNNING"
-    assert row["config"] == '{"k": 1}'
-    assert row["worker_count"] == 2
-
-
-def test_upsert_run_is_insert_or_ignore(filings_db):
-    rec = RunRecord(
-        run_id="run-1",
-        parent_run_id=None,
-        country="US",
-        started_at="2026-01-01T00:00:00",
-        finished_at=None,
-        status="RUNNING",
-        config=None,
-        worker_count=1,
-    )
-    upsert_run(filings_db, rec)
-    # Re-insert with different status — original row must survive.
-    upsert_run(
-        filings_db,
-        RunRecord(
-            run_id="run-1",
-            parent_run_id=None,
-            country="US",
-            started_at="2026-01-01T00:00:00",
-            finished_at="2026-01-01T01:00:00",
-            status="SUCCESS",
-            config=None,
-            worker_count=1,
-        ),
-    )
-    row = filings_db.execute(
-        "SELECT status, finished_at FROM scraper_runs WHERE run_id='run-1'"
-    ).fetchone()
-    assert row["status"] == "RUNNING"
-    assert row["finished_at"] is None
-
-
-def test_upsert_worker_inserts_worker_row(filings_db):
-    upsert_run(
-        filings_db,
-        RunRecord(
-            run_id="run-1",
-            parent_run_id=None,
-            country="US",
-            started_at="2026-01-01T00:00:00",
-            finished_at=None,
-            status="RUNNING",
-            config=None,
-            worker_count=1,
-        ),
-    )
-    upsert_worker(
-        filings_db,
-        WorkerRecord(
-            run_id="run-1-w1",
-            parent_run_id="run-1",
-            worker_id=1,
-            started_at="2026-01-01T00:00:00",
-            finished_at=None,
-            status="RUNNING",
-            files_scraped=0,
-        ),
-    )
-    row = filings_db.execute("SELECT * FROM scraper_runs WHERE run_id='run-1-w1'").fetchone()
-    assert row["worker_id"] == 1
-    assert row["country"] is None
-    assert row["config"] is None
-    assert row["parent_run_id"] == "run-1"
-
-
-# ---------------------------------------------------------------------------
-# companies / filings
-# ---------------------------------------------------------------------------
-
-
-def test_upsert_company_is_insert_or_ignore(filings_db):
-    upsert_company(
-        filings_db,
-        CompanyRecord("C001", "Acme", "ACME", "NASDAQ", "US", "2026-01-01"),
-    )
-    upsert_company(
-        filings_db,
-        CompanyRecord("C001", "Other Name", "X", "Y", "FR", "2026-02-02"),
-    )
-    row = filings_db.execute(
-        "SELECT name, ticker, country FROM companies WHERE company_id='C001'"
-    ).fetchone()
-    assert row["name"] == "Acme"
-    assert row["ticker"] == "ACME"
-    assert row["country"] == "US"
-
-
-def test_upsert_filing_is_insert_or_ignore_on_natural_key(filings_db):
-    upsert_company(
-        filings_db,
-        CompanyRecord("C001", "Acme", None, None, "US", None),
-    )
-    upsert_filing(
-        filings_db,
-        FilingRecord("f-1", "C001", 2024, "2025-02-15", "2024-12-31", "FY"),
-    )
-    # Second insert with same (company_id, fiscal_year), different filing_id:
-    # must be ignored, original row preserved.
-    upsert_filing(
-        filings_db,
-        FilingRecord("f-2", "C001", 2024, "2099-01-01", "2099-01-01", "OTHER"),
-    )
-    row = get_filing(filings_db, company_id="C001", fiscal_year=2024)
-    assert row is not None
-    assert row.filing_id == "f-1"
-    assert row.filing_date == "2025-02-15"
-    assert row.reporting_period == "FY"
-
-
-# ---------------------------------------------------------------------------
-# filing_files
-# ---------------------------------------------------------------------------
-
-
-def test_filing_file_insert_then_scrape(seeded_filings_db):
-    """PENDING row → SCRAPED row: the second call replaces the first."""
-    conn = seeded_filings_db
-    upsert_filing_file(conn, _ff(scrape_status="PENDING", gcs_path=None))
-    upsert_filing_file(
-        conn,
-        _ff(
-            file_id="ff-1",
-            scrape_status="SCRAPED",
-            gcs_path="gs://b/p.pdf",
-            scraped_at="2026-01-02T00:00:00",
-        ),
-    )
-    row = get_filing_file(conn, "f-1", "PDF", "10-K")
-    assert row is not None
-    assert row.scrape_status == "SCRAPED"
-    assert row.gcs_path == "gs://b/p.pdf"
-
-
-def test_filing_file_scraped_then_blocked(seeded_filings_db):
-    conn = seeded_filings_db
-    upsert_filing_file(
-        conn,
-        _ff(scrape_status="SCRAPED", scraped_at="2026-01-02T00:00:00"),
-    )
-    with pytest.raises(AlreadyScrapedError):
-        upsert_filing_file(
+class TestUpsertFileBasics:
+    def test_inserts_new_row(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
             conn,
-            _ff(file_id="ff-2", scrape_status="SCRAPED"),
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+            ),
         )
+        rows = conn.execute("SELECT COUNT(*) FROM files").fetchone()
+        assert rows[0] == 1
+
+    def test_file_id_is_derived(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                file_type="PDF",
+            ),
+        )
+        expected = make_file_id(company_id, "acc-1", "PDF")
+        actual = conn.execute("SELECT file_id FROM files").fetchone()[0]
+        assert actual == expected
+
+    def test_extension_auto_resolved_for_pdf(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                file_type="PDF",
+            ),
+        )
+        ext = conn.execute("SELECT extension FROM files").fetchone()[0]
+        assert ext == ".pdf"
+
+    def test_extension_auto_resolved_for_xbrl(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                file_type="XBRL",
+            ),
+        )
+        ext = conn.execute("SELECT extension FROM files").fetchone()[0]
+        assert ext == ".zip"
+
+    def test_raises_value_error_on_unknown_file_type(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        with pytest.raises(ValueError, match="Unknown file_type"):
+            upsert_file(
+                conn,
+                make_file_record(
+                    company_id=company_id,
+                    scraper_id=scraper_id,
+                    source_filing_id="acc-1",
+                    file_type="HTML",
+                ),
+            )
+
+    def test_no_row_inserted_when_file_type_invalid(self, seeded_db):
+        """ValueError fires BEFORE the INSERT, so the table stays empty."""
+        conn, scraper_id, company_id = seeded_db
+        try:
+            upsert_file(
+                conn,
+                make_file_record(
+                    company_id=company_id,
+                    scraper_id=scraper_id,
+                    source_filing_id="acc-1",
+                    file_type="HTML",
+                ),
+            )
+        except ValueError:
+            pass
+        assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
 
 
-def test_filing_file_force_overrides_scraped(seeded_filings_db):
-    conn = seeded_filings_db
-    upsert_filing_file(
-        conn,
-        _ff(
-            scrape_status="SCRAPED",
-            gcs_path="gs://b/first.pdf",
-            scraped_at="2026-01-02T00:00:00",
-        ),
-    )
-    upsert_filing_file(
-        conn,
-        _ff(
-            file_id="ff-2",
-            scrape_status="SCRAPED",
-            gcs_path="gs://b/second.pdf",
-            scraped_at="2026-02-02T00:00:00",
-        ),
-        force=True,
-    )
-    row = get_filing_file(conn, "f-1", "PDF", "10-K")
-    assert row is not None
-    assert row.file_id == "ff-2"
-    assert row.gcs_path == "gs://b/second.pdf"
+class TestFormTypeNormalisation:
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_none_or_empty_becomes_unknown(self, seeded_db, raw):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                form_type=raw,
+            ),
+        )
+        ft = conn.execute("SELECT form_type FROM files").fetchone()[0]
+        assert ft == "UNKNOWN"
+
+    def test_explicit_form_type_preserved(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                form_type="10-K",
+            ),
+        )
+        ft = conn.execute("SELECT form_type FROM files").fetchone()[0]
+        assert ft == "10-K"
 
 
-def test_filing_file_failed_overwritten_without_force(seeded_filings_db):
-    conn = seeded_filings_db
-    upsert_filing_file(conn, _ff(scrape_status="FAILED"))
-    upsert_filing_file(
-        conn,
-        _ff(
-            file_id="ff-2",
-            scrape_status="SCRAPED",
-            scraped_at="2026-01-02T00:00:00",
-        ),
-    )
-    row = get_filing_file(conn, "f-1", "PDF", "10-K")
-    assert row is not None
-    assert row.scrape_status == "SCRAPED"
-    assert row.file_id == "ff-2"
+class TestFiscalYearInvariant:
+    """status='SUCCESS' requires fiscal_year — Python check AND DB CHECK constraint."""
+
+    def test_success_with_fy_is_stored(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="SUCCESS",
+                fiscal_year=2024,
+            ),
+        )
+        row = conn.execute("SELECT fiscal_year FROM files").fetchone()
+        assert row[0] == 2024
+
+    def test_success_with_null_fy_raises_missing_fiscal_year_error(self, seeded_db):
+        from ar_db_handler import MissingFiscalYearError
+
+        conn, scraper_id, company_id = seeded_db
+        with pytest.raises(MissingFiscalYearError, match="fiscal_year"):
+            upsert_file(
+                conn,
+                make_file_record(
+                    company_id=company_id,
+                    scraper_id=scraper_id,
+                    source_filing_id="acc-1",
+                    status="SUCCESS",
+                    fiscal_year=None,
+                ),
+            )
+
+    def test_no_row_inserted_when_invariant_fails(self, seeded_db):
+        from ar_db_handler import MissingFiscalYearError
+
+        conn, scraper_id, company_id = seeded_db
+        with pytest.raises(MissingFiscalYearError):
+            upsert_file(
+                conn,
+                make_file_record(
+                    company_id=company_id,
+                    scraper_id=scraper_id,
+                    source_filing_id="acc-1",
+                    status="SUCCESS",
+                    fiscal_year=None,
+                ),
+            )
+        # Nothing in files — the check ran BEFORE the INSERT.
+        assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+
+    def test_pending_with_null_fy_is_allowed(self, seeded_db):
+        """PENDING rows may have NULL fiscal_year — work isn't committed yet."""
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="PENDING",
+                fiscal_year=None,
+                gcs_path=None,
+            ),
+        )
+        row = conn.execute("SELECT status, fiscal_year FROM files").fetchone()
+        assert row == ("PENDING", None)
+
+    def test_failed_with_null_fy_is_allowed(self, seeded_db):
+        """FAILED rows may have NULL fiscal_year — couldn't resolve, that's fine."""
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="FAILED",
+                fiscal_year=None,
+                gcs_path=None,
+                error_message="404",
+            ),
+        )
+        row = conn.execute("SELECT status, fiscal_year FROM files").fetchone()
+        assert row == ("FAILED", None)
 
 
-def test_filing_file_pending_overwritten_without_force(seeded_filings_db):
-    conn = seeded_filings_db
-    upsert_filing_file(conn, _ff(scrape_status="PENDING"))
-    upsert_filing_file(
-        conn,
-        _ff(
-            file_id="ff-2",
-            scrape_status="PENDING",
-            gcs_path="gs://b/p2.pdf",
-        ),
-    )
-    row = get_filing_file(conn, "f-1", "PDF", "10-K")
-    assert row is not None
-    assert row.file_id == "ff-2"
+# ---------------------------------------------------------------------------
+# AlreadyScrapedError and force=
+# ---------------------------------------------------------------------------
 
 
-def test_filing_file_form_type_null_handled(seeded_filings_db):
-    """A NULL form_type must round-trip via the IS NULL lookup."""
-    conn = seeded_filings_db
-    upsert_filing_file(conn, _ff(file_type="XBRL", form_type=None))
-    row = get_filing_file(conn, "f-1", "XBRL", None)
-    assert row is not None
-    assert row.form_type is None
+class TestAlreadyScrapedError:
+    def test_success_then_no_force_raises(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        rec = make_file_record(
+            company_id=company_id,
+            scraper_id=scraper_id,
+            source_filing_id="acc-1",
+            status="SUCCESS",
+        )
+        upsert_file(conn, rec)
+        with pytest.raises(AlreadyScrapedError):
+            upsert_file(conn, rec, force=False)
+
+    def test_success_then_force_overwrites(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        # First write at fiscal_year=2024
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="SUCCESS",
+                fiscal_year=2024,
+            ),
+        )
+        # Overwrite at fiscal_year=2023 with force=True
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="SUCCESS",
+                fiscal_year=2023,
+            ),
+            force=True,
+        )
+        fy = conn.execute("SELECT fiscal_year FROM files").fetchone()[0]
+        assert fy == 2023
+
+    def test_pending_overwritten_without_force(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="PENDING",
+            ),
+        )
+        # Without force=True: should overwrite cleanly.
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="SUCCESS",
+            ),
+        )
+        status = conn.execute("SELECT status FROM files").fetchone()[0]
+        assert status == "SUCCESS"
+
+    def test_failed_overwritten_without_force(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="FAILED",
+                error_message="404 not found",
+                gcs_path=None,
+            ),
+        )
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-1",
+                status="SUCCESS",
+                error_message=None,
+            ),
+        )
+        rows = conn.execute("SELECT status, error_message FROM files").fetchall()
+        assert len(rows) == 1
+        assert rows[0] == ("SUCCESS", None)
 
 
-def test_filing_file_distinct_form_types_coexist(seeded_filings_db):
-    """Same filing_id + file_type but different form_type → two rows."""
-    conn = seeded_filings_db
-    upsert_filing_file(
-        conn,
-        _ff(file_id="ff-a", file_type="PDF", form_type="10-K"),
-    )
-    upsert_filing_file(
-        conn,
-        _ff(file_id="ff-b", file_type="PDF", form_type="10-K/A"),
-    )
-    count = conn.execute(
-        "SELECT COUNT(*) AS n FROM filing_files WHERE filing_id='f-1' AND file_type='PDF'"
-    ).fetchone()["n"]
-    assert count == 2
+class TestAmendmentsCoexist:
+    """Two filings with the same fiscal_year but different source_filing_id stay separate."""
+
+    def test_10k_and_10ka_coexist(self, seeded_db):
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-10k",
+                form_type="10-K",
+                fiscal_year=2024,
+                file_type="PDF",
+            ),
+        )
+        upsert_file(
+            conn,
+            make_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-10ka",
+                form_type="10-KA",
+                fiscal_year=2024,
+                file_type="PDF",
+            ),
+        )
+        rows = conn.execute("SELECT form_type FROM files ORDER BY form_type").fetchall()
+        assert [r[0] for r in rows] == ["10-K", "10-KA"]
+
+
+# ---------------------------------------------------------------------------
+# upsert_company
+# ---------------------------------------------------------------------------
+
+
+class TestUpsertCompany:
+    def test_sets_is_in_company_info_to_1(self, filings_db):
+        # Even if the caller hands in 0, the helper forces it to 1.
+        upsert_company(
+            filings_db,
+            CompanyRecord(
+                company_id=42,
+                fs_ticker="MSFT",
+                country_code="US",
+                country="United States",
+                country_id="US",
+                file_name="msft",
+                coverage_status="LAFA",
+                start_year_force=2010,
+                is_in_company_info=0,
+            ),
+        )
+        flag = filings_db.execute(
+            "SELECT is_in_company_info FROM companies WHERE company_id = 42"
+        ).fetchone()[0]
+        assert flag == 1
+
+    def test_sets_last_synced_at(self, filings_db):
+        upsert_company(
+            filings_db,
+            CompanyRecord(
+                company_id=42,
+                fs_ticker="MSFT",
+                country_code="US",
+                country="United States",
+                country_id="US",
+                file_name="msft",
+                coverage_status="LAFA",
+                start_year_force=2010,
+            ),
+        )
+        ts = filings_db.execute(
+            "SELECT last_synced_at FROM companies WHERE company_id = 42"
+        ).fetchone()[0]
+        assert ts is not None and "T" in ts  # ISO-ish
+
+    def test_replace_overwrites(self, filings_db):
+        upsert_company(
+            filings_db,
+            CompanyRecord(
+                company_id=42,
+                fs_ticker="MSFT",
+                country_code="US",
+                country="United States",
+                country_id="US",
+                file_name="msft",
+                coverage_status="LAFA",
+                start_year_force=2010,
+            ),
+        )
+        upsert_company(
+            filings_db,
+            CompanyRecord(
+                company_id=42,
+                fs_ticker="MSFT",
+                country_code="US",
+                country="United States",
+                country_id="US",
+                file_name="msft_v2",
+                coverage_status="LANA",
+                start_year_force=2012,
+            ),
+        )
+        rows = filings_db.execute(
+            "SELECT file_name, coverage_status, start_year_force FROM companies"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0] == ("msft_v2", "LANA", 2012)
+
+
+# ---------------------------------------------------------------------------
+# update_run_finished
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateRunFinished:
+    def test_updates_all_count_columns(self, seeded_db):
+        conn, scraper_id, _ = seeded_db
+        update_run_finished(
+            conn,
+            scraper_id=scraper_id,
+            status="SUCCESS",
+            finished_at="2026-05-22T11:00:00+00:00",
+            elapsed_time=3600.5,
+            scraped_files=120,
+            xbrl_count=60,
+            pdf_count=60,
+            fail_count=2,
+        )
+        row = conn.execute(
+            """
+            SELECT status, finished_at, elapsed_time,
+                   scraped_files, xbrl_count, pdf_count, fail_count
+            FROM scraper_runs WHERE scraper_id = ?
+            """,
+            (scraper_id,),
+        ).fetchone()
+        assert row == (
+            "SUCCESS",
+            "2026-05-22T11:00:00+00:00",
+            3600.5,
+            120,
+            60,
+            60,
+            2,
+        )

@@ -1,42 +1,31 @@
-"""Initialise filings.db.
+"""
+``filings.db`` initialisation.
 
-Creates the file if it does not exist, applies the schema, enables WAL
-mode, and turns on FK enforcement. The schema uses `CREATE TABLE IF NOT
-EXISTS`, so calling this on an already-initialised file is a safe no-op.
+Thin wrapper around ``ar_db_handler.connection._init_db`` that targets the
+filings schema package.
 """
 
 from __future__ import annotations
 
-import logging
 import sqlite3
-from importlib.resources import files
 from pathlib import Path
 
-from ..connection import apply_schema, open_connection
-
-logger = logging.getLogger(__name__)
-
-
-def _read_schema() -> str:
-    return files("ar_db_handler.filings").joinpath("schema.sql").read_text()
+from ..connection import _init_db
 
 
 def init_filings_db(path: str | Path) -> sqlite3.Connection:
-    """Initialise filings.db and return an open connection.
-
-    Parameters
-    ----------
-    path:
-        Filesystem path to the SQLite file. Parent directories must
-        already exist.
-
-    Returns
-    -------
-    sqlite3.Connection
-        An open connection to the database. The caller is responsible
-        for closing it.
     """
-    conn = open_connection(path)
-    apply_schema(conn, _read_schema())
-    logger.info("Initialised filings.db at %s", path)
-    return conn
+    Create (or open) ``filings.db`` at ``path`` and return a connection.
+
+    The schema (``schema.sql`` in this package) is applied via
+    ``CREATE TABLE IF NOT EXISTS``, so calling this on an existing database
+    is a no-op for the tables themselves. WAL mode and foreign-key
+    enforcement are enabled on the returned connection.
+
+    Args:
+        path: Filesystem path to the SQLite database file.
+
+    Returns:
+        Open ``sqlite3.Connection``.
+    """
+    return _init_db(path, schema_package="ar_db_handler.filings")

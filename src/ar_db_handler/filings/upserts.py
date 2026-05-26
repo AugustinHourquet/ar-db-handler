@@ -1,44 +1,233 @@
-"""Write helpers for filings.db.
+"""
+Write helpers for ``filings.db``.
 
-All functions take an open `sqlite3.Connection` as their first argument
-and do not own it — the caller is responsible for transactions, commits,
-and closing.
+These functions enforce the project's upsert rules in Python rather than
+via SQL triggers — easier to test, easier to reason about, and avoids
+trigger compatibility quirks across SQLite versions.
 
-These helpers do commit (each call is a single logical write), but they
-operate within the connection passed in, so a caller that wants larger
-transactional units can wrap several calls in a `with conn:` block.
+Error-handling contract
+-----------------------
+Every helper here that rejects a row both **raises** an exception AND
+**records** the rejection to ``scraper_errors`` first. This means:
 
-Upsert semantics (enforced here in Python, not via SQL triggers):
+* The caller can ``except`` to handle the failure inline.
+* The error is durable even if the caller swallows the exception.
+* The recording uses the same connection — same transaction, no chance
+  of a partial state where the SQL row went in but the error row didn't.
 
-* `upsert_run`, `upsert_worker`, `upsert_company`, `upsert_filing`
-  use `INSERT OR IGNORE` — once written, the row is immutable from
-  this helper's perspective.
+The five categories recorded:
 
-* `upsert_filing_file` is the only non-trivial case:
-    - if a SCRAPED row already exists for the same
-      (filing_id, file_type, form_type) and `force=False`, raise
-      `AlreadyScrapedError`;
-    - otherwise `INSERT OR REPLACE`.
-
-  When `force=True`, the SCRAPED check is bypassed and the row is
-  always replaced. This is intended for re-scraping flows.
+================================  ========================================
+Trigger                           ``error_type``
+================================  ========================================
+unknown ``file_type``             ``ERROR_UNKNOWN_FILE_TYPE``
+SUCCESS row, ``fiscal_year=None`` ``ERROR_MISSING_FISCAL_YEAR``
+SUCCESS row exists, ``force=F``   ``ERROR_ALREADY_SCRAPED``
+bogus ``company_id``/scraper_id   ``ERROR_FK_VIOLATION``
+other CHECK constraint failure    ``ERROR_CHECK_VIOLATION``
+================================  ========================================
 """
 
 from __future__ import annotations
 
-import logging
+import json
 import sqlite3
+from dataclasses import asdict
+from datetime import datetime, timezone
 
-from ..exceptions import AlreadyScrapedError
-from ..records import (
+from .._models import (
+    ERROR_ALREADY_SCRAPED,
+    ERROR_CHECK_VIOLATION,
+    ERROR_FK_VIOLATION,
+    ERROR_MISSING_FISCAL_YEAR,
+    ERROR_UNKNOWN_FILE_TYPE,
+    AlreadyScrapedError,
     CompanyRecord,
-    FilingFileRecord,
-    FilingRecord,
+    ErrorRecord,
+    FileRecord,
+    MissingFiscalYearError,
     RunRecord,
-    WorkerRecord,
 )
+from ..ids import make_file_id, resolve_extension
+from .errors import record_error
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalise_form_type(raw: str | None) -> str:
+    """
+    Map ``None`` / ``""`` / whitespace to ``"UNKNOWN"``.
+
+    Centralised here so ``upsert_file()`` is the single point where the
+    normalisation happens — callers never need to handle it themselves.
+    """
+    if raw is None:
+        return "UNKNOWN"
+    stripped = raw.strip()
+    return stripped if stripped else "UNKNOWN"
+
+
+def _utc_now_iso() -> str:
+    """Current UTC time as an ISO-8601 string (seconds precision)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _record_for_file(record: FileRecord, error_type: str, message: str) -> ErrorRecord:
+    """Build an ErrorRecord pre-populated from a FileRecord's context."""
+    # Strip the bulkier fields out of the payload — the audit table doesn't
+    # need scraped_at / url / gcs_path for diagnostics, and keeping the
+    # payload small keeps the table manageable across many failures.
+    payload_dict = asdict(record)
+    return ErrorRecord(
+        scraper_id=record.scraper_id,
+        error_type=error_type,
+        error_message=message,
+        company_id=record.company_id,
+        source_filing_id=record.source_filing_id,
+        file_type=record.file_type,
+        payload=json.dumps(payload_dict, default=str),
+    )
+
+
+# ---------------------------------------------------------------------------
+# files
+# ---------------------------------------------------------------------------
+
+
+def upsert_file(
+    conn: sqlite3.Connection,
+    record: FileRecord,
+    force: bool = False,
+) -> None:
+    """
+    Insert or replace a row in ``files``.
+
+    Derivation done here (callers do not set these):
+      * ``file_id``  — ``make_file_id(company_id, source_filing_id, file_type)``
+      * ``extension`` — ``EXTENSION_MAP[file_type]`` (raises ``ValueError``
+        on unknown ``file_type``)
+      * ``form_type`` — ``None`` / ``""`` normalised to ``"UNKNOWN"``
+
+    Invariant enforced (Python-side check + DB CHECK constraint):
+      * if ``status='SUCCESS'`` then ``fiscal_year`` MUST NOT be ``None``
+
+    Upsert rules:
+      * No existing row matching the natural key            → ``INSERT``
+      * Existing row, ``status='SUCCESS'``, ``force=False`` → raise
+        ``AlreadyScrapedError``
+      * Existing row, ``status='PENDING'`` or ``'FAILED'``  → ``INSERT OR REPLACE``
+      * Any existing row with ``force=True``                → ``INSERT OR REPLACE``
+
+    Every rejection path records to ``scraper_errors`` before raising.
+
+    Raises:
+        ValueError:              when ``file_type`` is not in ``EXTENSION_MAP``.
+        MissingFiscalYearError:  when ``status='SUCCESS'`` and ``fiscal_year is None``.
+        AlreadyScrapedError:     when blocked by the SUCCESS+force=False rule.
+        sqlite3.IntegrityError:  FK or CHECK violations — re-raised after
+                                 being recorded.
+    """
+    # ---- Pre-flight 1: file_type → extension. Cheapest check; do it first. ----
+    try:
+        extension = resolve_extension(record.file_type)
+    except ValueError as exc:
+        record_error(
+            conn,
+            _record_for_file(record, ERROR_UNKNOWN_FILE_TYPE, str(exc)),
+        )
+        raise
+
+    # ---- Pre-flight 2: SUCCESS → fiscal_year MUST be set. ----
+    if record.status == "SUCCESS" and record.fiscal_year is None:
+        message = (
+            f"upsert_file: status='SUCCESS' requires fiscal_year != None. "
+            f"company_id={record.company_id}, "
+            f"source_filing_id={record.source_filing_id!r}, "
+            f"file_type={record.file_type!r}. "
+            f"Derive fiscal_year from reporting_date in the scraper before calling."
+        )
+        record_error(
+            conn,
+            _record_for_file(record, ERROR_MISSING_FISCAL_YEAR, message),
+        )
+        raise MissingFiscalYearError(message)
+
+    form_type = _normalise_form_type(record.form_type)
+    file_id = make_file_id(record.company_id, record.source_filing_id, record.file_type)
+
+    # ---- Pre-flight 3: SUCCESS-guard (only when force=False) ----
+    if not force:
+        existing = conn.execute(
+            """
+            SELECT status FROM files
+            WHERE company_id = ?
+              AND source_filing_id = ?
+              AND file_type = ?
+            """,
+            (record.company_id, record.source_filing_id, record.file_type),
+        ).fetchone()
+
+        if existing is not None and existing[0] == "SUCCESS":
+            message = (
+                f"File already scraped (status=SUCCESS) for "
+                f"company_id={record.company_id}, "
+                f"source_filing_id={record.source_filing_id!r}, "
+                f"file_type={record.file_type!r}. "
+                f"Pass force=True to overwrite."
+            )
+            record_error(
+                conn,
+                _record_for_file(record, ERROR_ALREADY_SCRAPED, message),
+            )
+            raise AlreadyScrapedError(message)
+
+    # ---- INSERT OR REPLACE — IntegrityError → record + re-raise ----
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO files (
+                file_id, company_id, scraper_id, status,
+                country_code, file_type, extension, form_type,
+                source_filing_id, fiscal_year,
+                reporting_date, filing_date, gcs_path, url,
+                scraped_at, error_message
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                file_id,
+                record.company_id,
+                record.scraper_id,
+                record.status,
+                record.country_code,
+                record.file_type,
+                extension,
+                form_type,
+                record.source_filing_id,
+                record.fiscal_year,
+                record.reporting_date,
+                record.filing_date,
+                record.gcs_path,
+                record.url,
+                record.scraped_at,
+                record.error_message,
+            ),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        # Heuristic: FK errors mention "FOREIGN KEY", CHECK errors mention
+        # "CHECK constraint". Distinguishing them in the audit log helps
+        # the caller spot upstream data drift vs. invariant bugs.
+        message = str(exc)
+        if "FOREIGN KEY" in message.upper():
+            err_type = ERROR_FK_VIOLATION
+        else:
+            err_type = ERROR_CHECK_VIOLATION
+        record_error(conn, _record_for_file(record, err_type, message))
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -47,62 +236,77 @@ logger = logging.getLogger(__name__)
 
 
 def upsert_run(conn: sqlite3.Connection, record: RunRecord) -> None:
-    """Insert a parent run row (worker_id IS NULL).
+    """
+    ``INSERT OR IGNORE`` a row in ``scraper_runs``.
 
-    `INSERT OR IGNORE` on conflict with `run_id`. Existing rows are not
-    overwritten — a run record, once created, is immutable through this
-    helper.
+    Called once at the start of a scraper run with ``status = 'RUNNING'``.
+    The IGNORE behaviour means re-issuing the same ``scraper_id`` (which
+    shouldn't happen — UUID4) silently does nothing rather than failing the
+    scraper at startup.
+
+    Use ``update_run_finished()`` to mark the run complete.
     """
     conn.execute(
         """
         INSERT OR IGNORE INTO scraper_runs (
-            run_id, parent_run_id, worker_id, country,
-            started_at, finished_at, status,
-            files_scraped, config, worker_count
-        ) VALUES (?, ?, NULL, ?, ?, ?, ?, 0, ?, ?)
+            scraper_id, country_code, workers_count, source_file,
+            log_path, version, started_at, status, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            record.run_id,
-            record.parent_run_id,
-            record.country,
+            record.scraper_id,
+            record.country_code,
+            record.workers_count,
+            record.source_file,
+            record.log_path,
+            record.version,
             record.started_at,
-            record.finished_at,
             record.status,
-            record.config,
-            record.worker_count,
+            record.metadata,
         ),
     )
     conn.commit()
 
 
-def upsert_worker(conn: sqlite3.Connection, record: WorkerRecord) -> None:
-    """Insert a worker row under an existing run.
+def update_run_finished(
+    conn: sqlite3.Connection,
+    scraper_id: str,
+    status: str,
+    finished_at: str,
+    elapsed_time: float,
+    scraped_files: int,
+    xbrl_count: int,
+    pdf_count: int,
+    fail_count: int,
+) -> None:
+    """
+    Close out a ``scraper_runs`` row at run end.
 
-    Worker rows have a non-NULL `worker_id` and NULL `country`/`config`.
-    The parent run row must already exist (FK constraint on
-    `parent_run_id` if set, and conceptually on `run_id` — note that the
-    schema stores worker rows in the same table keyed by `run_id`, so
-    the worker's `run_id` should be a *distinct* primary key from the
-    parent's; the parent is referenced via `parent_run_id`).
-
-    `INSERT OR IGNORE` on conflict with `run_id`.
+    Updates ``finished_at``, ``elapsed_time``, ``status``, and the four
+    count columns. ``status`` should be ``'SUCCESS'`` or ``'FAILED'`` —
+    leaving a row at ``'RUNNING'`` after the process exits is a bug.
     """
     conn.execute(
         """
-        INSERT OR IGNORE INTO scraper_runs (
-            run_id, parent_run_id, worker_id, country,
-            started_at, finished_at, status,
-            files_scraped, config, worker_count
-        ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL)
+        UPDATE scraper_runs
+        SET status        = ?,
+            finished_at   = ?,
+            elapsed_time  = ?,
+            scraped_files = ?,
+            xbrl_count    = ?,
+            pdf_count     = ?,
+            fail_count    = ?
+        WHERE scraper_id = ?
         """,
         (
-            record.run_id,
-            record.parent_run_id,
-            record.worker_id,
-            record.started_at,
-            record.finished_at,
-            record.status,
-            record.files_scraped,
+            status,
+            finished_at,
+            elapsed_time,
+            scraped_files,
+            xbrl_count,
+            pdf_count,
+            fail_count,
+            scraper_id,
         ),
     )
     conn.commit()
@@ -114,131 +318,34 @@ def upsert_worker(conn: sqlite3.Connection, record: WorkerRecord) -> None:
 
 
 def upsert_company(conn: sqlite3.Connection, record: CompanyRecord) -> None:
-    """Insert a company row.
+    """
+    ``INSERT OR REPLACE`` a row in ``companies``.
 
-    `INSERT OR IGNORE` on conflict with `company_id`. To update company
-    metadata, callers should delete + re-insert explicitly; this helper
-    will not overwrite.
+    Always overrides ``is_in_company_info`` to ``1`` and ``last_synced_at``
+    to the current UTC datetime — this is the success path of
+    ``sync_companies()``. Companies that are no longer in the snapshot are
+    deactivated in a separate sweep (``is_in_company_info = 0``) before
+    this function is called.
     """
     conn.execute(
         """
-        INSERT OR IGNORE INTO companies (
-            company_id, name, ticker, exchange, country, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            record.company_id,
-            record.name,
-            record.ticker,
-            record.exchange,
-            record.country,
-            record.updated_at,
-        ),
-    )
-    conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# filings
-# ---------------------------------------------------------------------------
-
-
-def upsert_filing(conn: sqlite3.Connection, record: FilingRecord) -> None:
-    """Insert a filing row.
-
-    `INSERT OR IGNORE` on conflict with `(company_id, fiscal_year)`.
-    The filing event is immutable: an existing row is never overwritten.
-    This is intentional — a company can have only one 10-K filing for a
-    given fiscal year, and that filing's identifying metadata (filing
-    date, reporting date) should not silently change.
-    """
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO filings (
-            filing_id, company_id, fiscal_year,
-            filing_date, reporting_date, reporting_period
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            record.filing_id,
-            record.company_id,
-            record.fiscal_year,
-            record.filing_date,
-            record.reporting_date,
-            record.reporting_period,
-        ),
-    )
-    conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# filing_files
-# ---------------------------------------------------------------------------
-
-
-def upsert_filing_file(
-    conn: sqlite3.Connection,
-    record: FilingFileRecord,
-    force: bool = False,
-) -> None:
-    """Upsert a filing_files row with status-aware semantics.
-
-    Behaviour
-    ---------
-    Look up the existing row, if any, on
-    `(filing_id, file_type, form_type)`:
-
-    * No existing row → `INSERT OR REPLACE` (effectively INSERT).
-    * Existing row, status != SCRAPED → `INSERT OR REPLACE`.
-    * Existing row, status == SCRAPED, `force=False` → raise
-      `AlreadyScrapedError`. The scraper is expected to have
-      checked `get_filing_file()` before attempting the download.
-    * Existing row, status == SCRAPED, `force=True` → `INSERT OR
-      REPLACE`. Used for explicit re-scraping flows.
-
-    Raises
-    ------
-    AlreadyScrapedError
-        When the SCRAPED row conflict is hit and `force` is False.
-    """
-    if not force:
-        existing = conn.execute(
-            """
-            SELECT scrape_status
-            FROM filing_files
-            WHERE filing_id = ?
-              AND file_type = ?
-              AND form_type IS ?
-            """,
-            (record.filing_id, record.file_type, record.form_type),
-        ).fetchone()
-
-        if existing is not None and existing["scrape_status"] == "SCRAPED":
-            raise AlreadyScrapedError(
-                f"filing_files row already SCRAPED for "
-                f"filing_id={record.filing_id!r}, file_type={record.file_type!r}, "
-                f"form_type={record.form_type!r}"
-            )
-
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO filing_files (
-            file_id, filing_id, run_id, worker_id,
-            file_type, form_type, gcs_path, url,
-            scrape_status, scraped_at
+        INSERT OR REPLACE INTO companies (
+            company_id, fs_ticker, country_code, country, country_id,
+            file_name, coverage_status, start_year_force,
+            is_in_company_info, last_synced_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            record.file_id,
-            record.filing_id,
-            record.run_id,
-            record.worker_id,
-            record.file_type,
-            record.form_type,
-            record.gcs_path,
-            record.url,
-            record.scrape_status,
-            record.scraped_at,
+            record.company_id,
+            record.fs_ticker,
+            record.country_code,
+            record.country,
+            record.country_id,
+            record.file_name,
+            record.coverage_status,
+            record.start_year_force,
+            1,  # always active on successful upsert
+            _utc_now_iso(),
         ),
     )
     conn.commit()

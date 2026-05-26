@@ -4,28 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ar-db-handler"
-version = "0.1.0"
-description = "SQLite data-access layer for the annual report pipeline (filings.db + metrics.db)."
+version = "0.2.1"
+description = "SQLite database layer for the annual report pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
-authors = [{ name = "Omaha Insights" }]
-dependencies = []  # stdlib sqlite3 only
+dependencies = [
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "python-dotenv>=1.0",
+]
 
 [project.optional-dependencies]
 dev = [
     "black==24.10.0",
     "ruff==0.7.0",
-    "pre-commit>=3.5",
     "pytest>=7.0",
+    "pre-commit>=3.5",
+]
+# GCS sync is optional — only needed by callers that invoke sync_companies().
+# Tests mock it, so the dev install does not pull it.
+gcs = [
+    "google-cloud-storage>=2.10",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-ar_db_handler = ["filings/schema.sql", "metrics/schema.sql"]
-
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
 [tool.black]
 line-length = 100
 target-version = ["py310"]
@@ -35,12 +42,10 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM"]
-ignore = [
-    "E501",  # line length handled by black
-]
+# Let black own formatting.
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]  # line length is black's job
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-python_files = ["test_*.py"]
 addopts = "-ra"

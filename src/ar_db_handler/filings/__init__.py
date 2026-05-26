@@ -1,21 +1,17 @@
-"""filings.db: schema, init, and write helpers."""
+"""Public API of the ``filings`` subpackage."""
 
-from __future__ import annotations
-
+from .errors import get_scraper_errors, record_error
 from .init import init_filings_db
-from .upserts import (
-    upsert_company,
-    upsert_filing,
-    upsert_filing_file,
-    upsert_run,
-    upsert_worker,
-)
+from .sync import sync_companies
+from .upserts import update_run_finished, upsert_company, upsert_file, upsert_run
 
 __all__ = [
     "init_filings_db",
-    "upsert_run",
-    "upsert_worker",
+    "sync_companies",
     "upsert_company",
-    "upsert_filing",
-    "upsert_filing_file",
+    "upsert_file",
+    "upsert_run",
+    "update_run_finished",
+    "record_error",
+    "get_scraper_errors",
 ]
