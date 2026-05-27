@@ -59,6 +59,7 @@ class MissingFiscalYearError(ArDbHandlerError):
 
 ERROR_UNKNOWN_FILE_TYPE = "UNKNOWN_FILE_TYPE"
 ERROR_MISSING_FISCAL_YEAR = "MISSING_FISCAL_YEAR"
+ERROR_MISSING_REPORTING_DATE = "MISSING_REPORTING_DATE"
 ERROR_ALREADY_SCRAPED = "ALREADY_SCRAPED"
 ERROR_FK_VIOLATION = "FK_VIOLATION"
 ERROR_CHECK_VIOLATION = "CHECK_VIOLATION"
@@ -86,7 +87,7 @@ class CompanyRecord:
     country_id: str | None
     file_name: str
     coverage_status: str
-    start_year_force: int = 2008
+    start_year_force: int = 2006
     is_in_company_info: int = 1
     last_synced_at: str | None = None
 
@@ -117,6 +118,17 @@ class FileRecord:
     * ``file_id``    — ``make_file_id(company_id, source_filing_id, file_type)``
     * ``extension``  — ``EXTENSION_MAP[file_type]``
 
+    Auto-fill behaviour in ``upsert_file()``:
+
+    * ``country_code`` — if left as ``None``, looked up from the
+      ``companies`` table by ``company_id``. A caller-supplied value
+      always wins. Defaults to ``None`` so SUCCESS-row callers can
+      omit it and let the upsert resolve it.
+    * ``gcs_path`` — if left as ``None`` on a SUCCESS row,
+      ``resolve_gcs_path(record)`` is called and the canonical blob
+      path is written to the row. Caller-supplied paths win
+      verbatim. PENDING/FAILED rows are left at ``None``.
+
     INVARIANT (enforced by ``upsert_file`` AND a CHECK constraint on the
     table): if ``status == 'SUCCESS'`` then ``fiscal_year`` MUST NOT be
     ``None``. The scraper derives ``fiscal_year`` from ``reporting_date``
@@ -125,20 +137,25 @@ class FileRecord:
     committed work.
     """
 
+    # ---- Mandatory: identity + lifecycle ----
     company_id: int
     scraper_id: str
     status: str  # SUCCESS | FAILED | PENDING
-    country_code: str
     file_type: str  # PDF | XBRL
     source_filing_id: str  # regulator-assigned ID — never derived
-    form_type: str | None  # None → normalised to 'UNKNOWN' by upsert_file()
-    fiscal_year: int | None  # MUST be set when status='SUCCESS'
-    reporting_date: str | None  # the year-derivation source
-    filing_date: str | None
-    gcs_path: str | None
-    url: str | None
-    scraped_at: str | None
-    error_message: str | None
+
+    # ---- Auto-fillable or optional ----
+    # country_code is required on the row but auto-fillable from the
+    # companies table when None — see upsert_file docs.
+    country_code: str | None = None
+    form_type: str | None = None  # None → normalised to 'UNKNOWN' by upsert_file()
+    fiscal_year: int | None = None  # MUST be set when status='SUCCESS'
+    reporting_date: str | None = None  # the year-derivation source AND path component
+    filing_date: str | None = None
+    gcs_path: str | None = None  # auto-filled on SUCCESS rows when None
+    url: str | None = None
+    scraped_at: str | None = None
+    error_message: str | None = None
 
 
 @dataclass

@@ -10,6 +10,8 @@ Public API (everything below is also importable straight from
 
 * Database init:        ``init_filings_db``, ``init_metrics_db``
 * ID generation:        ``make_file_id``, ``make_run_id``, ``EXTENSION_MAP``
+* GCS paths:            ``make_blob_path``, ``resolve_gcs_path``,
+                        ``derive_fiscal_year``
 * Filings write API:    ``upsert_run``, ``update_run_finished``,
                         ``upsert_company``, ``upsert_file``,
                         ``sync_companies``
@@ -27,7 +29,7 @@ Public API (everything below is also importable straight from
 
 from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.4.0"
 
 # --- Dataclasses + exceptions + error-type constants ----------------------
 from ._models import (
@@ -35,6 +37,7 @@ from ._models import (
     ERROR_CHECK_VIOLATION,
     ERROR_FK_VIOLATION,
     ERROR_MISSING_FISCAL_YEAR,
+    ERROR_MISSING_REPORTING_DATE,
     ERROR_SNAPSHOT_SCHEMA_DRIFT,
     ERROR_SYNC_NO_PERIOD,
     ERROR_UNKNOWN_FILE_TYPE,
@@ -66,6 +69,9 @@ from .filings import (
 from .ids import EXTENSION_MAP, make_file_id, make_run_id
 from .metrics import init_metrics_db, write_metric
 
+# --- GCS path resolution --------------------------------------------------
+from .paths import derive_fiscal_year, make_blob_path, resolve_gcs_path
+
 # --- Read helpers ---------------------------------------------------------
 from .queries import get_file, get_metric, get_scraped_files, get_scraped_pairs, list_companies
 
@@ -78,6 +84,10 @@ __all__ = [
     "make_file_id",
     "make_run_id",
     "EXTENSION_MAP",
+    # GCS path resolution
+    "make_blob_path",
+    "resolve_gcs_path",
+    "derive_fiscal_year",
     # Filings write API
     "upsert_run",
     "update_run_finished",
@@ -96,6 +106,7 @@ __all__ = [
     "SYSTEM_SCRAPER_ID",
     "ERROR_UNKNOWN_FILE_TYPE",
     "ERROR_MISSING_FISCAL_YEAR",
+    "ERROR_MISSING_REPORTING_DATE",
     "ERROR_ALREADY_SCRAPED",
     "ERROR_FK_VIOLATION",
     "ERROR_CHECK_VIOLATION",

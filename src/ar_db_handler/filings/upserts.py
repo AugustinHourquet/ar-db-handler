@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 
 from .._models import (
@@ -40,6 +40,7 @@ from .._models import (
     ERROR_CHECK_VIOLATION,
     ERROR_FK_VIOLATION,
     ERROR_MISSING_FISCAL_YEAR,
+    ERROR_MISSING_REPORTING_DATE,
     ERROR_UNKNOWN_FILE_TYPE,
     AlreadyScrapedError,
     CompanyRecord,
@@ -49,6 +50,7 @@ from .._models import (
     RunRecord,
 )
 from ..ids import make_file_id, resolve_extension
+from ..paths import resolve_gcs_path
 from .errors import record_error
 
 # ---------------------------------------------------------------------------
@@ -110,6 +112,16 @@ def upsert_file(
         on unknown ``file_type``)
       * ``form_type`` — ``None`` / ``""`` normalised to ``"UNKNOWN"``
 
+    Auto-fill on SUCCESS rows (caller-supplied values always win):
+      * ``country_code`` — if ``None``, looked up from the ``companies``
+        table. Records ``ERROR_FK_VIOLATION`` and raises ``IntegrityError``
+        if the company is not present.
+      * ``gcs_path`` — if ``None``, ``resolve_gcs_path(record)`` is
+        called. Records ``ERROR_MISSING_REPORTING_DATE`` (or whichever
+        component is missing) and raises ``ValueError`` on failure.
+      * PENDING / FAILED rows are left alone — they don't represent
+        committed work and may legitimately lack the path components.
+
     Invariant enforced (Python-side check + DB CHECK constraint):
       * if ``status='SUCCESS'`` then ``fiscal_year`` MUST NOT be ``None``
 
@@ -123,11 +135,16 @@ def upsert_file(
     Every rejection path records to ``scraper_errors`` before raising.
 
     Raises:
-        ValueError:              when ``file_type`` is not in ``EXTENSION_MAP``.
+        ValueError:              when ``file_type`` is not in ``EXTENSION_MAP``
+                                 OR when a SUCCESS row's auto-resolved
+                                 ``gcs_path`` is missing a required component
+                                 (e.g. ``reporting_date``).
         MissingFiscalYearError:  when ``status='SUCCESS'`` and ``fiscal_year is None``.
         AlreadyScrapedError:     when blocked by the SUCCESS+force=False rule.
-        sqlite3.IntegrityError:  FK or CHECK violations — re-raised after
-                                 being recorded.
+        sqlite3.IntegrityError:  FK or CHECK violations, OR a SUCCESS row
+                                 whose ``company_id`` isn't in ``companies``
+                                 (the country_code auto-fill catches this
+                                 earlier, with a clearer error type).
     """
     # ---- Pre-flight 1: file_type → extension. Cheapest check; do it first. ----
     try:
@@ -154,10 +171,66 @@ def upsert_file(
         )
         raise MissingFiscalYearError(message)
 
+    # ---- Pre-flight 3: auto-fill country_code from companies if missing. ----
+    # Caller's value wins. Only the SQL lookup is the auto-fill path;
+    # if the caller passed an explicit country_code, we never touch
+    # the companies table. This matches the same "caller wins" rule
+    # we use for gcs_path below.
+    if not record.country_code:
+        row = conn.execute(
+            "SELECT country_code FROM companies WHERE company_id = ?",
+            (record.company_id,),
+        ).fetchone()
+        if row is None:
+            message = (
+                f"upsert_file: company_id={record.company_id} not found "
+                f"in companies — cannot resolve country_code for "
+                f"source_filing_id={record.source_filing_id!r}, "
+                f"file_type={record.file_type!r}. "
+                f"Upsert the company first."
+            )
+            record_error(
+                conn,
+                _record_for_file(record, ERROR_FK_VIOLATION, message),
+            )
+            # Use IntegrityError so the caller's existing FK-handling
+            # code path catches this, even though we caught it before
+            # SQLite did.
+            raise sqlite3.IntegrityError(message)
+        # dataclasses.replace, never mutate the caller's record.
+        record = replace(record, country_code=row[0])
+
+    # ---- Pre-flight 4: auto-fill gcs_path on SUCCESS rows when missing. ----
+    # PENDING / FAILED rows are intentionally left with gcs_path=None —
+    # they don't represent committed work and may legitimately lack
+    # the components needed to build the path (e.g. reporting_date).
+    if not record.gcs_path and record.status == "SUCCESS":
+        try:
+            record = replace(record, gcs_path=resolve_gcs_path(record))
+        except (ValueError, MissingFiscalYearError) as exc:
+            # MissingFiscalYearError is caught by Pre-flight 2 above —
+            # but keep it in the except in case resolve_gcs_path's
+            # internal invariant ever triggers for a different reason.
+            # The most likely cause here is reporting_date being None
+            # on a SUCCESS row, hence the dedicated error type.
+            err_type = (
+                ERROR_MISSING_REPORTING_DATE
+                if isinstance(exc, ValueError)
+                else ERROR_MISSING_FISCAL_YEAR
+            )
+            message = (
+                f"upsert_file: cannot resolve gcs_path for "
+                f"company_id={record.company_id}, "
+                f"source_filing_id={record.source_filing_id!r}, "
+                f"file_type={record.file_type!r}: {exc}"
+            )
+            record_error(conn, _record_for_file(record, err_type, message))
+            raise
+
     form_type = _normalise_form_type(record.form_type)
     file_id = make_file_id(record.company_id, record.source_filing_id, record.file_type)
 
-    # ---- Pre-flight 3: SUCCESS-guard (only when force=False) ----
+    # ---- Pre-flight 5: SUCCESS-guard (only when force=False) ----
     if not force:
         existing = conn.execute(
             """

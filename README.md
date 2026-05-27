@@ -26,13 +26,14 @@ to read or write to a database imports from here.
 8. [The UNIQUE constraint](#the-unique-constraint)
 9. [`source_filing_id` — the country-agnostic skip anchor](#source_filing_id--the-country-agnostic-skip-anchor)
 10. [Fiscal year — derivation rule](#fiscal-year--derivation-rule)
-11. [The SUCCESS / fiscal_year invariant](#the-success--fiscal_year-invariant)
-12. [Error handling — the `scraper_errors` table](#error-handling--the-scraper_errors-table)
-13. [Amendment handling (10-K and 10-KA)](#amendment-handling-10-k-and-10-ka)
-14. [`sync_companies()`](#sync_companies)
-15. [`get_scraped_files()` — the scraper skip-set](#get_scraped_files--the-scraper-skip-set)
-16. [`AlreadyScrapedError` and the expected caller pattern](#alreadyscraperror-and-the-expected-caller-pattern)
-17. [Development commands](#development-commands)
+11. [GCS path resolution](#gcs-path-resolution)
+12. [The SUCCESS / fiscal_year invariant](#the-success--fiscal_year-invariant)
+13. [Error handling — the `scraper_errors` table](#error-handling--the-scraper_errors-table)
+14. [Amendment handling (10-K and 10-KA)](#amendment-handling-10-k-and-10-ka)
+15. [`sync_companies()`](#sync_companies)
+16. [`get_scraped_files()` — the scraper skip-set](#get_scraped_files--the-scraper-skip-set)
+17. [`AlreadyScrapedError` and the expected caller pattern](#alreadyscraperror-and-the-expected-caller-pattern)
+18. [Development commands](#development-commands)
 
 ---
 
@@ -91,6 +92,7 @@ ar-db-handler/
 │       ├── _models.py           # dataclasses + AlreadyScrapedError
 │       ├── connection.py        # shared init_db(), WAL mode, FK pragma
 │       ├── ids.py               # make_file_id, make_run_id, EXTENSION_MAP
+│       ├── paths.py             # make_blob_path, resolve_gcs_path, derive_fiscal_year
 │       ├── filings/
 │       │   ├── __init__.py
 │       │   ├── schema.sql       # filings.db DDL
@@ -120,6 +122,7 @@ ar-db-handler/
     ├── test_ids.py
     ├── test_metrics_schema.py
     ├── test_metrics_writer.py
+    ├── test_paths.py
     └── test_queries.py
 ```
 
@@ -161,21 +164,31 @@ make VENV=.venv-dev install
 make VENV=.venv-dev test
 ```
 
-### Configuring GCS credentials
+### Configuring GCS credentials and private dependencies
 
-`sync_companies()` reads the GCS service-account JSON path from the
-environment. Copy `.env.example` to `.env` and fill in the absolute
-path:
+`sync_companies()` loads `GCPWeeklyFiles` from `gcpBridge.py`, a
+private file in the `omaha_norma` project (not on PyPI). Configure
+your local `.env` with three variables:
 
 ```bash
 cp .env.example .env
-# Edit .env so OMAHA_GCS_CREDENTIALS points at your credentials JSON.
+# Then edit .env:
 ```
 
-The variable name (`OMAHA_GCS_CREDENTIALS`) matches the convention in
-`gcpBridge.py` (the master pipeline). Callers may also pass
-`credentials_path=...` explicitly to `sync_companies()` — the kwarg
-wins over the env var.
+```
+# Absolute path to gcpBridge.py in the omaha_norma project
+OMAHA_GCP_BRIDGE_PATH=C:\path\to\omaha_norma\src\omaha_norma\core\gcpBridge.py
+
+# Absolute path to omaha_norma's src/ directory (needed for gcpBridge's own imports)
+OMAHA_NORMA_SRC_PATH=C:\path\to\omaha_norma\src
+
+# GCS service-account credentials JSON
+OMAHA_GCS_CREDENTIALS=C:\path\to\personal_keys\gcs_credentials.json
+```
+
+Neither path is committed to git — `.env` is gitignored. Callers may
+also pass `credentials_path=...` explicitly to `sync_companies()` —
+the kwarg wins over the env var.
 
 ---
 
@@ -302,6 +315,128 @@ The scraper performs this resolution and sets `fiscal_year` on the
 `FileRecord` it hands to `upsert_file()`. `ar-db-handler` itself does
 not implement the resolution chain — it just persists the result and
 enforces the invariant below.
+
+---
+
+## GCS path resolution
+
+`ar-db-handler` owns the canonical GCS blob-path scheme for every
+file the pipeline writes:
+
+```
+rawdata/{country_code}/{company_id}/{fiscal_year}/{file_type}_{form_type}_{reporting_date}{extension}
+```
+
+Examples:
+
+* `rawdata/US/14778/2023/PDF_10-K_2023-12-31.pdf`
+* `rawdata/US/14778/2023/XBRL_10-K_2023-12-31.zip`
+* `rawdata/JP/200042/2023/PDF_ASR_2024-03-31.pdf`
+
+Why here? Because `ar-db-handler` already owns the canonical metadata
+(`company_id`, `file_type`, `form_type`, `fiscal_year`, `extension`)
+and has access to `country_code` via the `companies` table. Every
+consumer of the GCS layer already depends on `ar-db-handler`, so they
+get the path builder for free, and the path scheme and the DB schema
+evolve together.
+
+The path builder lives in `ar_db_handler.paths`. It does **not**
+import from `gcs-handler` — the path is just a string. `GCSClient` is
+bound to a bucket at construction time, so the bucket name is not
+part of this blob path.
+
+### Auto-resolution in `upsert_file()`
+
+When you call `upsert_file()` with `gcs_path=None` on a SUCCESS row,
+`ar-db-handler` resolves it for you:
+
+1. If `record.country_code` is missing, it's looked up from the
+   `companies` table by `company_id`. A missing company records
+   `ERROR_FK_VIOLATION` and raises `IntegrityError` before any insert.
+2. If `record.gcs_path` is missing, `resolve_gcs_path(record)` is
+   called and the result is written to the row. A missing
+   `reporting_date` records `ERROR_MISSING_REPORTING_DATE` and raises
+   `ValueError`.
+
+Caller-supplied values always win — pass an explicit `country_code`
+or `gcs_path` to override (e.g. backfilling pre-existing files into
+a legacy bucket layout).
+
+PENDING and FAILED rows are exempt from path resolution. They may
+legitimately lack `fiscal_year` or `reporting_date`, and the schema
+already allows their `gcs_path` to be NULL.
+
+### Typical caller flow
+
+```python
+from ar_db_handler import FileRecord, upsert_file
+
+record = FileRecord(
+    company_id=14778,
+    scraper_id=scraper_id,
+    status="SUCCESS",
+    file_type="PDF",
+    source_filing_id="0000320193-24-acme-2023",
+    form_type="10-K",
+    fiscal_year=2023,
+    reporting_date="2023-12-31",
+    # country_code and gcs_path are auto-filled by upsert_file()
+)
+upsert_file(conn, record)
+# The row written to files now has:
+#   country_code = "US"
+#   gcs_path     = "rawdata/US/14778/2023/PDF_10-K_2023-12-31.pdf"
+```
+
+### Standalone path builder
+
+If you need the path string without going through `upsert_file()`
+(e.g. you're about to call `GCSClient.upload(local_path, blob_path)`
+before the upsert), use `make_blob_path()` or `resolve_gcs_path()`
+directly:
+
+```python
+from ar_db_handler import make_blob_path, resolve_gcs_path
+
+# From raw components
+path = make_blob_path(
+    country_code="US",
+    company_id=14778,
+    fiscal_year=2023,
+    file_type="PDF",
+    form_type="10-K",
+    reporting_date="2023-12-31",
+    extension=".pdf",
+)
+# → "rawdata/US/14778/2023/PDF_10-K_2023-12-31.pdf"
+
+# Or from a partially-built FileRecord (extension is resolved internally)
+path = resolve_gcs_path(record)
+```
+
+Both raise `ValueError` for malformed components and
+`MissingFiscalYearError` when `fiscal_year is None` — same exception
+types `upsert_file()` raises.
+
+### Fiscal-year derivation helper
+
+For scrapers building `FileRecord`s, `derive_fiscal_year` applies the
+H2/H1 rule:
+
+* period-end in months 07–12 → `fiscal_year = year(reporting_date)`
+* period-end in months 01–06 → `fiscal_year = year(reporting_date) - 1`
+
+```python
+from ar_db_handler import derive_fiscal_year
+
+derive_fiscal_year("2023-12-31")   # → 2023
+derive_fiscal_year("2023-06-30")   # → 2022
+derive_fiscal_year("2024-03-31")   # → 2023
+```
+
+`make_blob_path()` does **not** call this — it trusts the value on
+the record. One source of truth for the rule, lives in
+`ar_db_handler.paths`.
 
 ---
 
@@ -468,8 +603,42 @@ result = sync_companies(conn)
 result = sync_companies(conn, country_code="US")
 
 print(result)
-# SyncResult(period='2026-05-22-W3', upserted=4231, delisted=7, country_code='US')
+# SyncResult(period='2026-05-21-W57', upserted=2770, delisted=0, country_code='US')
 ```
+
+To initialise the table for the first time, use the provided script:
+
+```bash
+python scripts/init_companies_table.py
+```
+
+### GCP column mapping
+
+The GCP snapshot (`companyInfo.parquet`) uses different column names
+from the DB schema. `sync_companies()` renames them on load:
+
+| GCP column        | DB column          |
+|-------------------|--------------------|
+| `CompanyID`       | `company_id`       |
+| `FactSet Ticker`  | `fs_ticker`        |
+| `fileName`        | `file_name`        |
+| `Coverage_Status` | `coverage_status`  |
+| `Country_Name`    | `country`          |
+| `StartYearForce`  | `start_year_force` |
+| `country_id`      | `country_id`       |
+
+`country_code` (e.g. `"US"`) is not present in the GCP file — it is
+derived from `Country_Name` via an internal `_COUNTRY_NAME_TO_CODE`
+mapping after the rename step. `country_id` is an internal company
+identifier stored as-is for cross-referencing with other GCP data.
+Rows with a null `StartYearForce` default to `2006`.
+
+### Country filtering
+
+The `country_code` argument is resolved to its full country name
+(e.g. `"US"` → `"UNITED STATES"`) and matched against the `Country_Name`
+column in the raw GCP file before any renaming. Add new countries to
+`_COUNTRY_NAME_TO_CODE` in `sync.py` if they are not yet covered.
 
 ### How deactivation works (step 5 of the procedure)
 

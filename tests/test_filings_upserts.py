@@ -471,3 +471,237 @@ class TestUpdateRunFinished:
             60,
             2,
         )
+
+
+# ---------------------------------------------------------------------------
+# upsert_file — auto-fill of country_code and gcs_path (v0.4.0)
+# ---------------------------------------------------------------------------
+
+
+def _bare_file_record(
+    *,
+    company_id,
+    scraper_id,
+    source_filing_id,
+    status="SUCCESS",
+    country_code=None,
+    file_type="PDF",
+    form_type="10-K",
+    fiscal_year=2023,
+    reporting_date="2023-12-31",
+    gcs_path=None,
+):
+    """
+    A FileRecord builder for the auto-fill tests.
+
+    Unlike ``conftest.make_file_record``, this one defaults
+    ``country_code`` and ``gcs_path`` to ``None`` so we can exercise
+    the auto-fill branches inside ``upsert_file``.
+    """
+    from ar_db_handler import FileRecord
+
+    return FileRecord(
+        company_id=company_id,
+        scraper_id=scraper_id,
+        status=status,
+        file_type=file_type,
+        source_filing_id=source_filing_id,
+        country_code=country_code,
+        form_type=form_type,
+        fiscal_year=fiscal_year,
+        reporting_date=reporting_date,
+        filing_date="2024-02-15",
+        gcs_path=gcs_path,
+        url=None,
+        scraped_at=None,
+        error_message=None,
+    )
+
+
+class TestUpsertFileAutoFill:
+    """
+    Behaviour added in v0.4.0: ``upsert_file`` auto-fills missing
+    ``country_code`` (from ``companies``) and ``gcs_path`` (via
+    ``resolve_gcs_path``) on SUCCESS rows. Caller-supplied values
+    always win.
+    """
+
+    def test_success_row_auto_fills_country_code_and_gcs_path(self, seeded_db):
+        """The canonical happy path — caller omits both, both get filled."""
+        conn, scraper_id, company_id = seeded_db
+        # seeded_db's company is AAPL/US.
+
+        upsert_file(
+            conn,
+            _bare_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-auto-1",
+                status="SUCCESS",
+                country_code=None,  # ← should be filled from companies
+                gcs_path=None,  # ← should be built from metadata
+                fiscal_year=2023,
+                reporting_date="2023-12-31",
+            ),
+        )
+
+        row = conn.execute(
+            "SELECT country_code, gcs_path FROM files WHERE source_filing_id = ?",
+            ("acc-auto-1",),
+        ).fetchone()
+        assert row[0] == "US"
+        assert row[1] == f"rawdata/US/{company_id}/2023/PDF_10-K_2023-12-31.pdf"
+
+    def test_explicit_country_code_wins_no_companies_lookup(self, seeded_db):
+        """
+        Caller-supplied ``country_code`` is written verbatim, NOT
+        overwritten by the companies-table lookup.
+
+        We prove this by making the companies row disagree: seeded_db
+        has country_code='US', we pass 'CA'. If the helper performed
+        the lookup unconditionally, we'd see 'US' in the row.
+        """
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            _bare_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-auto-2",
+                status="SUCCESS",
+                country_code="CA",  # ← caller wins, even though company is 'US'
+                fiscal_year=2023,
+                reporting_date="2023-12-31",
+            ),
+        )
+
+        row = conn.execute(
+            "SELECT country_code, gcs_path FROM files WHERE source_filing_id = ?",
+            ("acc-auto-2",),
+        ).fetchone()
+        assert row[0] == "CA"
+        # And the auto-filled gcs_path uses the caller's value too.
+        assert row[1].startswith("rawdata/CA/")
+
+    def test_explicit_gcs_path_is_written_verbatim(self, seeded_db):
+        """Pre-existing or backfilled paths must survive the upsert."""
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            _bare_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-auto-3",
+                status="SUCCESS",
+                country_code="US",
+                gcs_path="gs://legacy-bucket/old-scheme/file.pdf",
+                fiscal_year=2023,
+                reporting_date="2023-12-31",
+            ),
+        )
+        row = conn.execute(
+            "SELECT gcs_path FROM files WHERE source_filing_id = ?",
+            ("acc-auto-3",),
+        ).fetchone()
+        assert row[0] == "gs://legacy-bucket/old-scheme/file.pdf"
+
+    def test_pending_row_with_null_path_components_is_unchanged(self, seeded_db):
+        """
+        PENDING rows are intentionally exempt from path resolution —
+        they may legitimately lack fiscal_year and reporting_date.
+        gcs_path must remain NULL.
+        """
+        conn, scraper_id, company_id = seeded_db
+        upsert_file(
+            conn,
+            _bare_file_record(
+                company_id=company_id,
+                scraper_id=scraper_id,
+                source_filing_id="acc-auto-4",
+                status="PENDING",
+                country_code=None,  # still auto-filled — that's cheap
+                fiscal_year=None,  # legal on PENDING
+                reporting_date=None,  # legal on PENDING
+                gcs_path=None,
+            ),
+        )
+        row = conn.execute(
+            "SELECT country_code, gcs_path FROM files WHERE source_filing_id = ?",
+            ("acc-auto-4",),
+        ).fetchone()
+        # country_code lookup still happens (cheap, useful), but path
+        # resolution is skipped because status != 'SUCCESS'.
+        assert row[0] == "US"
+        assert row[1] is None
+
+    def test_success_row_unknown_company_records_fk_violation(self, seeded_db):
+        """
+        company_id absent from companies + country_code=None →
+        ERROR_FK_VIOLATION recorded, IntegrityError raised.
+
+        We catch this BEFORE letting SQLite produce its own FK error
+        so the message names the auto-fill cause specifically.
+        """
+        from ar_db_handler import ERROR_FK_VIOLATION, get_scraper_errors
+
+        conn, scraper_id, _ = seeded_db
+        with pytest.raises(__import__("sqlite3").IntegrityError, match="not found"):
+            upsert_file(
+                conn,
+                _bare_file_record(
+                    company_id=999_999,  # ← no such company
+                    scraper_id=scraper_id,
+                    source_filing_id="acc-auto-5",
+                    status="SUCCESS",
+                    country_code=None,  # forces the companies lookup
+                    fiscal_year=2023,
+                    reporting_date="2023-12-31",
+                ),
+            )
+        errs = get_scraper_errors(conn, error_type=ERROR_FK_VIOLATION)
+        assert len(errs) == 1
+        assert errs[0]["company_id"] == 999_999
+        # And no row landed in files.
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM files WHERE source_filing_id = ?",
+                ("acc-auto-5",),
+            ).fetchone()[0]
+            == 0
+        )
+
+    def test_success_row_null_reporting_date_records_missing_reporting_date(self, seeded_db):
+        """
+        SUCCESS + country_code=None + reporting_date=None →
+        country_code gets resolved, then resolve_gcs_path raises
+        ValueError, which we record as ERROR_MISSING_REPORTING_DATE.
+        """
+        from ar_db_handler import ERROR_MISSING_REPORTING_DATE, get_scraper_errors
+
+        conn, scraper_id, company_id = seeded_db
+        with pytest.raises(ValueError, match="reporting_date"):
+            upsert_file(
+                conn,
+                _bare_file_record(
+                    company_id=company_id,
+                    scraper_id=scraper_id,
+                    source_filing_id="acc-auto-6",
+                    status="SUCCESS",
+                    country_code=None,
+                    fiscal_year=2023,
+                    reporting_date=None,  # ← the offending field
+                    gcs_path=None,
+                ),
+            )
+        errs = get_scraper_errors(conn, error_type=ERROR_MISSING_REPORTING_DATE)
+        assert len(errs) == 1
+        assert errs[0]["company_id"] == company_id
+        assert errs[0]["source_filing_id"] == "acc-auto-6"
+        # No row in files.
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM files WHERE source_filing_id = ?",
+                ("acc-auto-6",),
+            ).fetchone()[0]
+            == 0
+        )

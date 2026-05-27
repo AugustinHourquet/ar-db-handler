@@ -67,6 +67,76 @@ _OPTIONAL_COLUMNS: tuple[str, ...] = (
     "start_year_force",
 )
 
+# GCP snapshot column names → internal DB column names.
+# country_code is NOT in this map — it is derived from Country_Name via
+# _COUNTRY_NAME_TO_CODE after loading, never read directly from the snapshot.
+_GCP_COLUMN_RENAMES: dict[str, str] = {
+    "CompanyID": "company_id",
+    "FactSet Ticker": "fs_ticker",
+    "fileName": "file_name",
+    "Coverage_Status": "coverage_status",
+    "Country_Name": "country",
+    "StartYearForce": "start_year_force",
+}
+
+# Mapping from GCP Country_Name values to ISO country codes stored in the DB.
+_COUNTRY_NAME_TO_CODE: dict[str, str] = {
+    "UNITED STATES": "US",
+    "JAPAN": "JP",
+    "UNITED KINGDOM": "GB",
+    "GERMANY": "DE",
+    "FRANCE": "FR",
+    "CANADA": "CA",
+    "AUSTRALIA": "AU",
+    "CHINA": "CN",
+    "SOUTH KOREA": "KR",
+    "INDIA": "IN",
+    "BRAZIL": "BR",
+    "ITALY": "IT",
+    "SPAIN": "ES",
+    "NETHERLANDS": "NL",
+    "SWITZERLAND": "CH",
+    "SWEDEN": "SE",
+    "NORWAY": "NO",
+    "DENMARK": "DK",
+    "FINLAND": "FI",
+    "BELGIUM": "BE",
+    "AUSTRIA": "AT",
+    "PORTUGAL": "PT",
+    "IRELAND": "IE",
+    "SINGAPORE": "SG",
+    "HONG KONG": "HK",
+    "TAIWAN": "TW",
+    "ISRAEL": "IL",
+    "SOUTH AFRICA": "ZA",
+    "MEXICO": "MX",
+    "ARGENTINA": "AR",
+    "CHILE": "CL",
+    "COLOMBIA": "CO",
+    "POLAND": "PL",
+    "CZECH REPUBLIC": "CZ",
+    "HUNGARY": "HU",
+    "GREECE": "GR",
+    "TURKEY": "TR",
+    "RUSSIA": "RU",
+    "SAUDI ARABIA": "SA",
+    "UNITED ARAB EMIRATES": "AE",
+    "QATAR": "QA",
+    "KUWAIT": "KW",
+    "EGYPT": "EG",
+    "INDONESIA": "ID",
+    "MALAYSIA": "MY",
+    "THAILAND": "TH",
+    "PHILIPPINES": "PH",
+    "VIETNAM": "VN",
+    "PAKISTAN": "PK",
+    "BANGLADESH": "BD",
+    "NEW ZEALAND": "NZ",
+}
+
+# Reverse map: country_code → Country_Name (used to resolve the GCP filter).
+_COUNTRY_CODE_TO_NAME: dict[str, str] = {v: k for k, v in _COUNTRY_NAME_TO_CODE.items()}
+
 
 def _resolve_credentials_path(explicit: str | None) -> str | None:
     """
@@ -100,7 +170,7 @@ def _row_to_record(row: dict) -> CompanyRecord:
         country_id=(None if row.get("country_id") is None else str(row.get("country_id"))),
         file_name=str(row["file_name"]),
         coverage_status=str(row["coverage_status"]),
-        start_year_force=int(row.get("start_year_force") or 2008),
+        start_year_force=int(row.get("start_year_force") or 2006),
         # is_in_company_info & last_synced_at are forced by upsert_company().
     )
 
@@ -151,7 +221,7 @@ def sync_companies(
     conn: sqlite3.Connection,
     country_code: str | None = None,
     credentials_path: str | None = None,
-    filename: str = "company_info.parquet",
+    filename: str = "companyInfo.parquet",
 ) -> SyncResult:
     """
     Pull the latest company reference file from GCS and upsert into ``companies``.
@@ -188,15 +258,20 @@ def sync_companies(
         KeyError:     when a row in the snapshot is missing a required
                       column. Surfaces here so schema drift is loud.
     """
-    # Lazy import — keeps the optional dependency truly optional for the
-    # rest of the package.
-    try:
-        from gcpBridge import GCPWeeklyFiles
-    except ImportError as exc:  # pragma: no cover
+    # Lazy import — gcpBridge is a private file in the global project, not an
+    # installable package. OMAHA_GCP_BRIDGE_PATH in .env points to it locally.
+    gcp_bridge_path = os.environ.get("OMAHA_GCP_BRIDGE_PATH")
+    if not gcp_bridge_path:  # pragma: no cover
         raise ImportError(
-            "sync_companies() requires GCPWeeklyFiles (gcpBridge module). "
-            "Install the [gcs] extra and ensure gcpBridge is importable."
-        ) from exc
+            "sync_companies() requires GCPWeeklyFiles. "
+            "Set OMAHA_GCP_BRIDGE_PATH in your .env to the absolute path of gcpBridge.py."
+        )
+    import sys
+    sys.path.insert(0, os.path.dirname(gcp_bridge_path))
+    omaha_norma_src = os.environ.get("OMAHA_NORMA_SRC_PATH")
+    if omaha_norma_src:
+        sys.path.insert(0, omaha_norma_src)
+    from gcpBridge import GCPWeeklyFiles
 
     resolved_creds = _resolve_credentials_path(credentials_path)
     bridge = GCPWeeklyFiles(credentials_path=resolved_creds)
@@ -219,38 +294,54 @@ def sync_companies(
         raise RuntimeError(message)
 
     df = bridge.read_file_from_period(period, filename)
+    if df is not None and not df.empty:
+        # Step 4: filter on Country_Name (GCP column) BEFORE rename, using
+        # the reverse-mapped country name derived from the caller's country_code.
+        if country_code is not None:
+            country_name = _COUNTRY_CODE_TO_NAME.get(country_code)
+            if country_name is None:
+                raise ValueError(
+                    f"sync_companies: country_code {country_code!r} is not in "
+                    f"_COUNTRY_NAME_TO_CODE mapping. Add it to sync.py."
+                )
+            if "Country_Name" not in df.columns:
+                message = (
+                    "Snapshot DataFrame is missing the 'Country_Name' column — "
+                    "cannot apply country filter."
+                )
+                record_error(
+                    conn,
+                    ErrorRecord(
+                        scraper_id=SYSTEM_SCRAPER_ID,
+                        error_type=ERROR_SNAPSHOT_SCHEMA_DRIFT,
+                        error_message=message,
+                        payload=json.dumps(
+                            {
+                                "period": period,
+                                "filename": filename,
+                                "columns_present": sorted(df.columns.tolist()),
+                                "filter_requested": country_code,
+                            }
+                        ),
+                    ),
+                )
+                raise KeyError(message)
+            df = df[df["Country_Name"].str.upper() == country_name].copy()
+
+        df = df.rename(columns=_GCP_COLUMN_RENAMES)
+
+        # Inject country_code from the mapping — the GCP file has no ISO code column.
+        # Only possible after rename; if Country_Name was missing the rename
+        # produces no "country" column and _row_to_record will raise schema drift.
+        if "country" in df.columns:
+            df["country_code"] = df["country"].str.upper().map(_COUNTRY_NAME_TO_CODE)
+
     if df is None or df.empty:
         logger.warning(
-            "Snapshot %s/%s is empty — nothing to upsert. " "(deactivation step still ran)",
+            "Snapshot %s/%s is empty — nothing to upsert. (deactivation step still ran)",
             period,
             filename,
         )
-
-    # Step 4: country_code filter scopes everything that follows.
-    if country_code is not None and df is not None and not df.empty:
-        if "country_code" not in df.columns:
-            message = (
-                "Snapshot DataFrame is missing the 'country_code' column — "
-                "cannot apply country_code filter."
-            )
-            record_error(
-                conn,
-                ErrorRecord(
-                    scraper_id=SYSTEM_SCRAPER_ID,
-                    error_type=ERROR_SNAPSHOT_SCHEMA_DRIFT,
-                    error_message=message,
-                    payload=json.dumps(
-                        {
-                            "period": period,
-                            "filename": filename,
-                            "columns_present": sorted(df.columns.tolist()),
-                            "filter_requested": country_code,
-                        }
-                    ),
-                ),
-            )
-            raise KeyError(message)
-        df = df[df["country_code"].astype(str) == str(country_code)].copy()
 
     # Step 5: deactivate first. The rowcount is an upper bound on delistings —
     # we refine it below by counting how many rows were reactivated.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ar-db-handler"
-version = "0.2.1"
+version = "0.4.0"
 description = "SQLite database layer for the annual report pipeline."
 readme = "README.md"
 requires-python = ">=3.10"

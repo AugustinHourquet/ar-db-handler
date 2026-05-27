@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS companies (
     country_id          TEXT,
     file_name           TEXT NOT NULL,
     coverage_status     TEXT NOT NULL,                  -- LAFA | LANA | PARR | ...
-    start_year_force    INTEGER DEFAULT 2008,
+    start_year_force    INTEGER DEFAULT 2006,
     is_in_company_info  INTEGER NOT NULL DEFAULT 1,     -- 1 = active in master pipeline, 0 = delisted/dropped
     last_synced_at      TEXT                            -- ISO datetime of last successful sync
 );

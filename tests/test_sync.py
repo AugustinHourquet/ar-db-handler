@@ -70,8 +70,29 @@ def fake_gcp(monkeypatch):
 
 
 def _make_df(rows: list[dict]) -> pd.DataFrame:
-    """Build a snapshot DataFrame with the columns sync_companies expects."""
+    """Build a snapshot DataFrame using GCP column names (pre-rename)."""
     return pd.DataFrame(rows)
+
+
+def _gcp_row(
+    company_id: int,
+    fs_ticker: str,
+    country_name: str,
+    file_name: str,
+    coverage_status: str = "LAFA",
+    start_year_force: int | None = None,
+) -> dict:
+    """Return a row as it arrives from GCP (GCP column names, no country_code)."""
+    row = {
+        "CompanyID": company_id,
+        "FactSet Ticker": fs_ticker,
+        "Country_Name": country_name,
+        "fileName": file_name,
+        "Coverage_Status": coverage_status,
+    }
+    if start_year_force is not None:
+        row["StartYearForce"] = start_year_force
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -81,20 +102,7 @@ def _make_df(rows: list[dict]) -> pd.DataFrame:
 
 class TestSyncResultShape:
     def test_returns_sync_result(self, filings_db, fake_gcp):
-        fake_gcp.df = _make_df(
-            [
-                {
-                    "company_id": 1,
-                    "fs_ticker": "AAPL",
-                    "country_code": "US",
-                    "country": "United States",
-                    "country_id": "US",
-                    "file_name": "aapl",
-                    "coverage_status": "LAFA",
-                    "start_year_force": 2008,
-                },
-            ]
-        )
+        fake_gcp.df = _make_df([_gcp_row(1, "AAPL", "UNITED STATES", "aapl")])
         out = sync_companies(filings_db)
         assert isinstance(out, SyncResult)
         assert out.period == "2026-05-22-W3"
@@ -106,18 +114,7 @@ class TestSyncResultShape:
 class TestUpsertCounts:
     def test_upserted_counts_match_snapshot_rows(self, filings_db, fake_gcp):
         fake_gcp.df = _make_df(
-            [
-                {
-                    "company_id": i,
-                    "fs_ticker": f"T{i}",
-                    "country_code": "US",
-                    "country": "United States",
-                    "country_id": "US",
-                    "file_name": f"t{i}",
-                    "coverage_status": "LAFA",
-                }
-                for i in range(1, 6)
-            ]
+            [_gcp_row(i, f"T{i}", "UNITED STATES", f"t{i}") for i in range(1, 6)]
         )
         out = sync_companies(filings_db)
         assert out.upserted == 5
@@ -134,30 +131,17 @@ class TestDeactivationStep:
                     company_id=cid,
                     fs_ticker=f"T{cid}",
                     country_code="US",
-                    country="United States",
-                    country_id="US",
+                    country="UNITED STATES",
+                    country_id=None,
                     file_name=f"t{cid}",
                     coverage_status="LAFA",
                 ),
             )
         # Snapshot only contains company_id=10 — company 20 should be flagged.
-        fake_gcp.df = _make_df(
-            [
-                {
-                    "company_id": 10,
-                    "fs_ticker": "T10",
-                    "country_code": "US",
-                    "country": "United States",
-                    "country_id": "US",
-                    "file_name": "t10",
-                    "coverage_status": "LAFA",
-                }
-            ]
-        )
+        fake_gcp.df = _make_df([_gcp_row(10, "T10", "UNITED STATES", "t10")])
         out = sync_companies(filings_db)
         assert out.upserted == 1
         assert out.delisted == 1
-        # And verify the actual DB state:
         active = filings_db.execute(
             "SELECT company_id FROM companies WHERE is_in_company_info = 1 ORDER BY company_id"
         ).fetchall()
@@ -182,92 +166,52 @@ class TestDeactivationStep:
                 company_id=10,
                 fs_ticker="T10",
                 country_code="US",
-                country="United States",
-                country_id="US",
+                country="UNITED STATES",
+                country_id=None,
                 file_name="t10",
                 coverage_status="LAFA",
             ),
         )
-        fake_gcp.df = _make_df(
-            [
-                {
-                    "company_id": 10,
-                    "fs_ticker": "T10_new",
-                    "country_code": "US",
-                    "country": "United States",
-                    "country_id": "US",
-                    "file_name": "t10_new",
-                    "coverage_status": "LAFA",
-                }
-            ]
-        )
+        fake_gcp.df = _make_df([_gcp_row(10, "T10_new", "UNITED STATES", "t10_new")])
         out = sync_companies(filings_db)
-        assert out.delisted == 0  # no one missing
+        assert out.delisted == 0
         assert out.upserted == 1
         row = filings_db.execute(
             "SELECT is_in_company_info, file_name FROM companies WHERE company_id = 10"
         ).fetchone()
-        assert row == (1, "t10_new")  # active AND updated
+        assert row == (1, "t10_new")
 
 
 class TestCountryCodeFilter:
     def test_country_filter_scopes_deactivation(self, filings_db, fake_gcp):
         """A JP-scoped sync must not deactivate US rows that are absent from
         the (JP-filtered) snapshot."""
-        # Pre-seed: 1 US + 1 JP
         upsert_company(
             filings_db,
             CompanyRecord(
-                company_id=10,
-                fs_ticker="US10",
-                country_code="US",
-                country="United States",
-                country_id="US",
-                file_name="us10",
+                company_id=10, fs_ticker="US10", country_code="US",
+                country="UNITED STATES", country_id=None, file_name="us10",
                 coverage_status="LAFA",
             ),
         )
         upsert_company(
             filings_db,
             CompanyRecord(
-                company_id=20,
-                fs_ticker="JP20",
-                country_code="JP",
-                country="Japan",
-                country_id="JP",
-                file_name="jp20",
+                company_id=20, fs_ticker="JP20", country_code="JP",
+                country="JAPAN", country_id=None, file_name="jp20",
                 coverage_status="LAFA",
             ),
         )
-        # Snapshot contains a mix; we'll filter to JP. The snapshot's JP entry
-        # is the same company (20) so nothing JP-side gets delisted.
         fake_gcp.df = _make_df(
             [
-                {
-                    "company_id": 10,
-                    "fs_ticker": "US10",
-                    "country_code": "US",
-                    "country": "United States",
-                    "country_id": "US",
-                    "file_name": "us10",
-                    "coverage_status": "LAFA",
-                },
-                {
-                    "company_id": 20,
-                    "fs_ticker": "JP20",
-                    "country_code": "JP",
-                    "country": "Japan",
-                    "country_id": "JP",
-                    "file_name": "jp20",
-                    "coverage_status": "LAFA",
-                },
+                _gcp_row(10, "US10", "UNITED STATES", "us10"),
+                _gcp_row(20, "JP20", "JAPAN", "jp20"),
             ]
         )
         out = sync_companies(filings_db, country_code="JP")
         assert out.country_code == "JP"
-        assert out.upserted == 1  # only the JP row was upserted
-        assert out.delisted == 0  # JP row is still present in the snapshot
-        # And — critically — US row must NOT have been deactivated.
+        assert out.upserted == 1
+        assert out.delisted == 0
         us_flag = filings_db.execute(
             "SELECT is_in_company_info FROM companies WHERE company_id = 10"
         ).fetchone()[0]
@@ -278,28 +222,12 @@ class TestCountryCodeFilter:
         upsert_company(
             filings_db,
             CompanyRecord(
-                company_id=20,
-                fs_ticker="JP20",
-                country_code="JP",
-                country="Japan",
-                country_id="JP",
-                file_name="jp20",
+                company_id=20, fs_ticker="JP20", country_code="JP",
+                country="JAPAN", country_id=None, file_name="jp20",
                 coverage_status="LAFA",
             ),
         )
-        fake_gcp.df = _make_df(
-            [
-                {
-                    "company_id": 10,
-                    "fs_ticker": "US10",
-                    "country_code": "US",
-                    "country": "United States",
-                    "country_id": "US",
-                    "file_name": "us10",
-                    "coverage_status": "LAFA",
-                }
-            ]
-        )
+        fake_gcp.df = _make_df([_gcp_row(10, "US10", "UNITED STATES", "us10")])
         out = sync_companies(filings_db, country_code="JP")
         assert out.upserted == 0
         assert out.delisted == 1
@@ -315,7 +243,7 @@ class TestCredentialsResolution:
         # since each test creates one instance, we can check that the path
         # was wired through to __init__ by reading the class-level marker.
         # Easiest path: assert no exception + correct file used.
-        assert _FakeGCPWeeklyFiles.last_call == ("2026-05-22-W3", "company_info.parquet")
+        assert _FakeGCPWeeklyFiles.last_call == ("2026-05-22-W3", "companyInfo.parquet")
 
     def test_env_var_used_when_no_kwarg(self, filings_db, fake_gcp, monkeypatch):
         # Patch the resolver directly to assert wiring without monkey-patching
@@ -353,14 +281,9 @@ class TestEmptySnapshot:
 
 class TestSchemaDrift:
     def test_missing_required_column_raises(self, filings_db, fake_gcp):
-        fake_gcp.df = _make_df(
-            [
-                {
-                    "company_id": 1,
-                    # missing: fs_ticker, country_code, country, ...
-                }
-            ]
-        )
+        # Provide a row that is missing most GCP columns — after rename/inject
+        # it will be missing required DB columns and should raise.
+        fake_gcp.df = _make_df([{"CompanyID": 1}])
         with pytest.raises(KeyError, match="missing required column"):
             sync_companies(filings_db)
 
